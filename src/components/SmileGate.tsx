@@ -6,6 +6,13 @@ interface Props {
   onUnlock: () => void
 }
 
+// Pinned version — never use @latest in production
+const MEDIAPIPE_VERSION = '0.10.14'
+const MEDIAPIPE_ESM = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MEDIAPIPE_VERSION}/+esm`
+const MEDIAPIPE_WASM = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MEDIAPIPE_VERSION}/wasm`
+const MODEL_URL =
+  'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task'
+
 export default function SmileGate({ visible, onUnlock }: Props) {
   const videoRef   = useRef<HTMLVideoElement>(null)
   const rafRef     = useRef<number>(0)
@@ -14,45 +21,59 @@ export default function SmileGate({ visible, onUnlock }: Props) {
 
   const [progress, setProgress] = useState(0)
   const [loaded,   setLoaded]   = useState(false)
+  const [status,   setStatus]   = useState('Initialising…')
 
-  /* Load MediaPipe once */
+  /* Load MediaPipe once — GPU first, CPU fallback */
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
+    let cancelled = false
+
+    const tryLoad = async (delegate: 'GPU' | 'CPU') => {
+      const { FaceLandmarker, FilesetResolver } = await import(
+        /* @vite-ignore */
+        MEDIAPIPE_ESM
+      )
+      const vision = await FilesetResolver.forVisionTasks(MEDIAPIPE_WASM)
+      if (cancelled) return
+      landmarker.current = await FaceLandmarker.createFromOptions(vision, {
+        baseOptions: { modelAssetPath: MODEL_URL, delegate },
+        outputFaceBlendshapes: true,
+        runningMode: 'VIDEO',
+      })
+    }
+
+    ;(async () => {
       try {
-        const { FaceLandmarker, FilesetResolver } = await import(
-          /* @vite-ignore */
-          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/+esm'
-        )
-        const vision = await FilesetResolver.forVisionTasks(
-          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm'
-        )
-        if (cancelled) return
-        landmarker.current = await FaceLandmarker.createFromOptions(vision, {
-          baseOptions: {
-            modelAssetPath:
-              'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
-            delegate: 'GPU',
-          },
-          outputFaceBlendshapes: true,
-          runningMode: 'VIDEO',
-        })
-        setLoaded(true)
-      } catch (e) {
-        console.warn('MediaPipe failed:', e)
-        setTimeout(onUnlock, 2000)
+        setStatus('Loading AI…')
+        await tryLoad('GPU')
+        if (!cancelled) { setLoaded(true); setStatus('Smile to unlock ✨') }
+      } catch (gpuErr) {
+        console.warn('GPU delegate failed, trying CPU…', gpuErr)
+        try {
+          await tryLoad('CPU')
+          if (!cancelled) { setLoaded(true); setStatus('Smile to unlock ✨') }
+        } catch (cpuErr) {
+          console.warn('MediaPipe fully failed — auto-unlocking', cpuErr)
+          if (!cancelled) {
+            setStatus('Camera unavailable')
+            setTimeout(onUnlock, 1500)
+          }
+        }
       }
     })()
+
     return () => { cancelled = true }
   }, [onUnlock])
 
   /* Start camera when visible */
   useEffect(() => {
     if (!visible) return
-    let active = true;
-    (async () => {
+    let active = true
+
+    ;(async () => {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } })
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'user' },
+        })
         if (!active) { stream.getTracks().forEach(t => t.stop()); return }
         streamRef.current = stream
         if (videoRef.current) {
@@ -64,6 +85,7 @@ export default function SmileGate({ visible, onUnlock }: Props) {
         onUnlock()
       }
     })()
+
     return () => {
       active = false
       streamRef.current?.getTracks().forEach(t => t.stop())
@@ -100,14 +122,14 @@ export default function SmileGate({ visible, onUnlock }: Props) {
   if (!visible) return null
 
   const sparklePositions = [
-    { top: '-4%',  left: '50%'  },
-    { top: '8%',   right: '-4%' },
-    { top: '50%',  right: '-6%' },
-    { bottom: '6%',right: '2%'  },
-    { bottom: '-4%',left: '48%' },
-    { bottom: '6%',left: '2%'   },
-    { top: '50%',  left: '-6%'  },
-    { top: '8%',   left: '-4%'  },
+    { top: '-4%',   left: '50%'   },
+    { top: '8%',    right: '-4%'  },
+    { top: '50%',   right: '-6%'  },
+    { bottom: '6%', right: '2%'   },
+    { bottom: '-4%',left: '48%'   },
+    { bottom: '6%', left: '2%'    },
+    { top: '50%',   left: '-6%'   },
+    { top: '8%',    left: '-4%'   },
   ]
 
   return (
@@ -139,7 +161,6 @@ export default function SmileGate({ visible, onUnlock }: Props) {
         }
       `}</style>
 
-      {/* ── MIRROR SCENE ── */}
       <div style={{
         position: 'relative', display: 'flex',
         alignItems: 'center', justifyContent: 'center',
@@ -164,10 +185,8 @@ export default function SmileGate({ visible, onUnlock }: Props) {
 
         {/* Mirror frame */}
         <div style={{
-          position: 'relative',
-          width: '72%', height: '72%',
-          borderRadius: '50%',
-          overflow: 'hidden',
+          position: 'relative', width: '72%', height: '72%',
+          borderRadius: '50%', overflow: 'hidden',
           boxShadow: `
             0 0 0 2px rgba(201,160,128,0.6),
             0 0 0 6px rgba(120,70,50,0.35),
@@ -199,8 +218,7 @@ export default function SmileGate({ visible, onUnlock }: Props) {
           <video ref={videoRef} muted playsInline style={{
             position: 'absolute', inset: 0,
             width: '100%', height: '100%',
-            objectFit: 'cover',
-            transform: 'scaleX(-1)',
+            objectFit: 'cover', transform: 'scaleX(-1)',
             borderRadius: '50%',
             filter: 'sepia(20%) contrast(1.05) brightness(0.9)',
           }} />
@@ -223,8 +241,8 @@ export default function SmileGate({ visible, onUnlock }: Props) {
           {/* Smile prompt */}
           <div style={{
             position: 'absolute', bottom: '10%', left: '50%',
-            transform: 'translateX(-50%)',
-            zIndex: 4, display: 'flex', flexDirection: 'column',
+            transform: 'translateX(-50%)', zIndex: 4,
+            display: 'flex', flexDirection: 'column',
             alignItems: 'center', gap: '6px', width: '70%',
           }}>
             <p style={{
@@ -233,7 +251,7 @@ export default function SmileGate({ visible, onUnlock }: Props) {
               letterSpacing: '0.3em', textTransform: 'uppercase',
               color: 'rgba(201,160,128,0.85)', whiteSpace: 'nowrap',
             }}>
-              {loaded ? 'Smile to unlock ✨' : 'Initialising…'}
+              {status}
             </p>
             <div style={{
               width: '100%', height: '3px',
@@ -241,11 +259,9 @@ export default function SmileGate({ visible, onUnlock }: Props) {
               borderRadius: '4px', overflow: 'hidden',
             }}>
               <div style={{
-                height: '100%',
-                width: `${progress * 100}%`,
+                height: '100%', width: `${progress * 100}%`,
                 background: 'linear-gradient(90deg, #c45b6a, #e89060)',
-                borderRadius: '4px',
-                transition: 'width 0.12s ease',
+                borderRadius: '4px', transition: 'width 0.12s ease',
                 boxShadow: '0 0 8px rgba(196,91,106,0.7)',
               }} />
             </div>
@@ -255,8 +271,7 @@ export default function SmileGate({ visible, onUnlock }: Props) {
         {/* Sparkles */}
         {sparklePositions.map((pos, i) => (
           <div key={i} style={{
-            position: 'absolute',
-            ...pos,
+            position: 'absolute', ...pos,
             color: '#c9a080', fontSize: '0.7rem',
             animation: `sparkleDrift 4s ease-in-out ${(i * 0.5).toFixed(1)}s infinite`,
           }}>✦</div>
