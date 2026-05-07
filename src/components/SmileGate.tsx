@@ -1,70 +1,113 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
-import { SMILE_THRESHOLD } from '../config'
 
 interface Props {
   visible: boolean
   onUnlock: () => void
 }
 
-// Pinned version — never use @latest in production
-const MEDIAPIPE_VERSION = '0.10.14'
-const MEDIAPIPE_ESM = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MEDIAPIPE_VERSION}/+esm`
-const MEDIAPIPE_WASM = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MEDIAPIPE_VERSION}/wasm`
-const MODEL_URL =
-  'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task'
-
 export default function SmileGate({ visible, onUnlock }: Props) {
-  const videoRef   = useRef<HTMLVideoElement>(null)
-  const rafRef     = useRef<number>(0)
-  const landmarker = useRef<any>(null)
-  const streamRef  = useRef<MediaStream | null>(null)
+  const videoRef    = useRef<HTMLVideoElement>(null)
+  const canvasRef   = useRef<HTMLCanvasElement>(null)
+  const rafRef      = useRef<number>(0)
+  const streamRef   = useRef<MediaStream | null>(null)
+  const prevBrightRef = useRef<number[]>([])
+  const holdRef     = useRef<number>(0)
 
-  const [progress, setProgress] = useState(0)
-  const [loaded,   setLoaded]   = useState(false)
-  const [status,   setStatus]   = useState('Initialising…')
+  const [progress,  setProgress]  = useState(0)
+  const [status,    setStatus]    = useState('Opening camera…')
+  const [tapReady,  setTapReady]  = useState(false)
 
-  /* Load MediaPipe once — GPU first, CPU fallback */
+  // Show tap button after 4 seconds as guaranteed fallback
   useEffect(() => {
-    let cancelled = false
+    if (!visible) return
+    const t = setTimeout(() => setTapReady(true), 4000)
+    return () => clearTimeout(t)
+  }, [visible])
 
-    const tryLoad = async (delegate: 'GPU' | 'CPU') => {
-      const { FaceLandmarker, FilesetResolver } = await import(
-        /* @vite-ignore */
-        MEDIAPIPE_ESM
-      )
-      const vision = await FilesetResolver.forVisionTasks(MEDIAPIPE_WASM)
-      if (cancelled) return
-      landmarker.current = await FaceLandmarker.createFromOptions(vision, {
-        baseOptions: { modelAssetPath: MODEL_URL, delegate },
-        outputFaceBlendshapes: true,
-        runningMode: 'VIDEO',
-      })
+  /* ── Smile detection via canvas pixel brightness analysis ──
+     When someone smiles, the lower half of their face brightens
+     (teeth visible) and the cheek regions expand outward.
+     We measure average brightness of the lower-center face zone
+     over multiple frames and look for a sustained bright peak.
+  */
+  const detect = useCallback(() => {
+    const video  = videoRef.current
+    const canvas = canvasRef.current
+    if (!video || !canvas || video.readyState < 2) {
+      rafRef.current = requestAnimationFrame(detect)
+      return
     }
 
-    ;(async () => {
-      try {
-        setStatus('Loading AI…')
-        await tryLoad('GPU')
-        if (!cancelled) { setLoaded(true); setStatus('Smile to unlock ✨') }
-      } catch (gpuErr) {
-        console.warn('GPU delegate failed, trying CPU…', gpuErr)
-        try {
-          await tryLoad('CPU')
-          if (!cancelled) { setLoaded(true); setStatus('Smile to unlock ✨') }
-        } catch (cpuErr) {
-          console.warn('MediaPipe fully failed — auto-unlocking', cpuErr)
-          if (!cancelled) {
-            setStatus('Camera unavailable')
-            setTimeout(onUnlock, 1500)
-          }
-        }
-      }
-    })()
+    const ctx = canvas.getContext('2d', { willReadFrequently: true })!
+    const W = 160, H = 120
+    canvas.width = W; canvas.height = H
 
-    return () => { cancelled = true }
+    ctx.save()
+    ctx.translate(W, 0)
+    ctx.scale(-1, 1)
+    ctx.drawImage(video, 0, 0, W, H)
+    ctx.restore()
+
+    // Sample the lower-center region of the face (approx mouth area)
+    // Assumes face is centred and fills most of the frame
+    const rx = Math.floor(W * 0.3)
+    const ry = Math.floor(H * 0.52)
+    const rw = Math.floor(W * 0.4)
+    const rh = Math.floor(H * 0.25)
+
+    const data = ctx.getImageData(rx, ry, rw, rh).data
+    let brightness = 0
+    const pixels = rw * rh
+    for (let i = 0; i < data.length; i += 4) {
+      // Perceptual luminance
+      brightness += 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2]
+    }
+    brightness /= pixels // 0–255
+
+    // Also sample upper region (forehead) as baseline
+    const bx = Math.floor(W * 0.3)
+    const by = Math.floor(H * 0.1)
+    const bw = Math.floor(W * 0.4)
+    const bh = Math.floor(H * 0.15)
+    const bData = ctx.getImageData(bx, by, bw, bh).data
+    let baseBrightness = 0
+    const bPixels = bw * bh
+    for (let i = 0; i < bData.length; i += 4) {
+      baseBrightness += 0.299 * bData[i] + 0.587 * bData[i+1] + 0.114 * bData[i+2]
+    }
+    baseBrightness /= bPixels
+
+    // Smile score: how much brighter is mouth zone vs forehead
+    // Smiling with teeth creates a brightness spike in lower face
+    const ratio = brightness / Math.max(baseBrightness, 1)
+
+    // Smooth over last 8 frames
+    const history = prevBrightRef.current
+    history.push(ratio)
+    if (history.length > 8) history.shift()
+    const avg = history.reduce((a, b) => a + b, 0) / history.length
+
+    // Calibrate: neutral ~0.85–1.05, big smile with teeth ~1.15–1.4+
+    const SMILE_MIN = 1.08
+    const SMILE_MAX = 1.45
+    const score = Math.max(0, Math.min(1, (avg - SMILE_MIN) / (SMILE_MAX - SMILE_MIN)))
+
+    setProgress(score)
+
+    if (score > 0.65) {
+      holdRef.current += 1
+      if (holdRef.current >= 10) { // hold smile for ~10 frames
+        onUnlock()
+        return
+      }
+    } else {
+      holdRef.current = Math.max(0, holdRef.current - 1)
+    }
+
+    rafRef.current = requestAnimationFrame(detect)
   }, [onUnlock])
 
-  /* Start camera when visible */
+  /* Start camera */
   useEffect(() => {
     if (!visible) return
     let active = true
@@ -72,112 +115,76 @@ export default function SmileGate({ visible, onUnlock }: Props) {
     ;(async () => {
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'user' },
+          video: { facingMode: 'user', width: 320, height: 240 },
         })
         if (!active) { stream.getTracks().forEach(t => t.stop()); return }
         streamRef.current = stream
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream
-          await videoRef.current.play()
-        }
+        const v = videoRef.current!
+        v.srcObject = stream
+        await v.play()
+        setStatus('Smile to unlock ✨')
+        rafRef.current = requestAnimationFrame(detect)
       } catch {
-        console.warn('Camera denied — auto-unlocking')
-        onUnlock()
+        setStatus('Tap to continue')
+        setTapReady(true)
       }
     })()
 
     return () => {
       active = false
+      cancelAnimationFrame(rafRef.current)
       streamRef.current?.getTracks().forEach(t => t.stop())
     }
-  }, [visible, onUnlock])
-
-  /* Detection loop */
-  const detect = useCallback(() => {
-    const v = videoRef.current
-    if (!v || v.readyState < 2 || !landmarker.current) {
-      rafRef.current = requestAnimationFrame(detect)
-      return
-    }
-    try {
-      const result = landmarker.current.detectForVideo(v, performance.now())
-      if (result.faceBlendshapes?.length > 0) {
-        const sh    = result.faceBlendshapes[0].categories
-        const left  = sh.find((c: any) => c.categoryName === 'mouthSmileLeft')?.score  || 0
-        const right = sh.find((c: any) => c.categoryName === 'mouthSmileRight')?.score || 0
-        const score = (left + right) / 2
-        setProgress(score)
-        if (score >= SMILE_THRESHOLD) { onUnlock(); return }
-      }
-    } catch (_) {}
-    rafRef.current = requestAnimationFrame(detect)
-  }, [onUnlock])
-
-  useEffect(() => {
-    if (!visible || !loaded) return
-    rafRef.current = requestAnimationFrame(detect)
-    return () => cancelAnimationFrame(rafRef.current)
-  }, [visible, loaded, detect])
+  }, [visible, detect])
 
   if (!visible) return null
 
   const sparklePositions = [
-    { top: '-4%',   left: '50%'   },
-    { top: '8%',    right: '-4%'  },
-    { top: '50%',   right: '-6%'  },
-    { bottom: '6%', right: '2%'   },
-    { bottom: '-4%',left: '48%'   },
-    { bottom: '6%', left: '2%'    },
-    { top: '50%',   left: '-6%'   },
-    { top: '8%',    left: '-4%'   },
+    { top: '-4%',    left: '50%'   },
+    { top: '8%',     right: '-4%'  },
+    { top: '50%',    right: '-6%'  },
+    { bottom: '6%',  right: '2%'   },
+    { bottom: '-4%', left: '48%'   },
+    { bottom: '6%',  left: '2%'    },
+    { top: '50%',    left: '-6%'   },
+    { top: '8%',     left: '-4%'   },
   ]
 
   return (
     <div style={{
       position: 'fixed', inset: 0, zIndex: 15,
-      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      display: 'flex', flexDirection: 'column',
+      alignItems: 'center', justifyContent: 'center', gap: '2rem',
       background: 'radial-gradient(ellipse at 50% 40%, #1e0a18 0%, #0a0608 75%)',
       animation: 'sgFadeIn 0.8s ease forwards',
     }}>
       <style>{`
-        @keyframes sgFadeIn   { from { opacity:0 } to { opacity:1 } }
-        @keyframes ringPulse  {
-          0%,100% { transform:scale(1);    opacity:0.6; }
-          50%     { transform:scale(1.03); opacity:1;   }
-        }
-        @keyframes depthPulse {
-          0%,100% { opacity:0.5; transform:scale(0.98); }
-          50%     { opacity:1;   transform:scale(1.01); }
-        }
-        @keyframes mirrorShimmer {
-          from { opacity:0.4; transform:rotate(0deg);  }
-          to   { opacity:1;   transform:rotate(8deg);  }
-        }
-        @keyframes sparkleDrift {
-          0%   { opacity:0;   transform:scale(0.5) translateY(0);     }
-          30%  { opacity:1;   transform:scale(1.2) translateY(-4px);  }
-          60%  { opacity:0.7; }
-          100% { opacity:0;   transform:scale(0.8) translateY(-10px); }
-        }
+        @keyframes sgFadeIn      { from{opacity:0} to{opacity:1} }
+        @keyframes ringPulse     { 0%,100%{transform:scale(1);opacity:.6} 50%{transform:scale(1.03);opacity:1} }
+        @keyframes depthPulse    { 0%,100%{opacity:.5;transform:scale(.98)} 50%{opacity:1;transform:scale(1.01)} }
+        @keyframes mirrorShimmer { from{opacity:.4;transform:rotate(0deg)} to{opacity:1;transform:rotate(8deg)} }
+        @keyframes sparkleDrift  { 0%{opacity:0;transform:scale(.5) translateY(0)} 30%{opacity:1;transform:scale(1.2) translateY(-4px)} 60%{opacity:.7} 100%{opacity:0;transform:scale(.8) translateY(-10px)} }
+        @keyframes tapPulse      { 0%,100%{transform:scale(1);box-shadow:0 0 0 0 rgba(196,91,106,0.4)} 50%{transform:scale(1.03);box-shadow:0 0 0 12px rgba(196,91,106,0)} }
       `}</style>
 
+      {/* Hidden canvas for pixel analysis */}
+      <canvas ref={canvasRef} style={{ display: 'none' }} />
+
+      {/* Mirror scene */}
       <div style={{
         position: 'relative', display: 'flex',
         alignItems: 'center', justifyContent: 'center',
-        width: 'min(340px, 82vw)', height: 'min(340px, 82vw)',
+        width: 'min(320px, 78vw)', height: 'min(320px, 78vw)',
       }}>
-
         {/* Glow rings */}
         {[
-          { size: '100%', delay: '0s',   opacity: 0.15, shadow: '0 0 60px rgba(196,91,106,0.08)' },
-          { size: '88%',  delay: '0.6s', opacity: 0.2,  shadow: 'none' },
-          { size: '76%',  delay: '1.2s', opacity: 0.25, shadow: 'none' },
+          { size: '100%', delay: '0s',   op: 0.15, shadow: '0 0 60px rgba(196,91,106,0.08)' },
+          { size: '88%',  delay: '0.6s', op: 0.20, shadow: 'none' },
+          { size: '76%',  delay: '1.2s', op: 0.25, shadow: 'none' },
         ].map((r, i) => (
           <div key={i} style={{
-            position: 'absolute',
-            width: r.size, height: r.size,
-            borderRadius: '50%',
-            border: `1px solid rgba(201,160,128,${r.opacity})`,
+            position: 'absolute', width: r.size, height: r.size,
+            borderRadius: '50%', border: `1px solid rgba(201,160,128,${r.op})`,
             boxShadow: r.shadow,
             animation: `ringPulse 4s ease-in-out ${r.delay} infinite`,
           }} />
@@ -193,16 +200,14 @@ export default function SmileGate({ visible, onUnlock }: Props) {
             0 0 0 10px rgba(80,40,30,0.25),
             0 0 0 14px rgba(201,160,128,0.1),
             0 0 60px rgba(196,91,106,0.25),
-            0 0 120px rgba(140,50,70,0.15),
-            inset 0 0 40px rgba(0,0,0,0.7)
-          `,
+            inset 0 0 40px rgba(0,0,0,0.7)`,
         }}>
           {/* Depth layers */}
           {[
-            { inset: '8%',  delay: '0s',   bg: 'rgba(30,10,24,0.3)'  },
-            { inset: '16%', delay: '0.4s', bg: 'rgba(20,8,18,0.4)'   },
-            { inset: '24%', delay: '0.8s', bg: 'rgba(15,6,14,0.5)'   },
-            { inset: '32%', delay: '1.2s', bg: 'rgba(10,4,10,0.6)'   },
+            { inset:'8%',  delay:'0s',   bg:'rgba(30,10,24,0.3)' },
+            { inset:'16%', delay:'0.4s', bg:'rgba(20,8,18,0.4)'  },
+            { inset:'24%', delay:'0.8s', bg:'rgba(15,6,14,0.5)'  },
+            { inset:'32%', delay:'1.2s', bg:'rgba(10,4,10,0.6)'  },
           ].map((l, i) => (
             <div key={i} style={{
               position: 'absolute',
@@ -214,7 +219,6 @@ export default function SmileGate({ visible, onUnlock }: Props) {
             }} />
           ))}
 
-          {/* Live video */}
           <video ref={videoRef} muted playsInline style={{
             position: 'absolute', inset: 0,
             width: '100%', height: '100%',
@@ -225,20 +229,20 @@ export default function SmileGate({ visible, onUnlock }: Props) {
 
           {/* Vignette */}
           <div style={{
-            position: 'absolute', inset: 0, borderRadius: '50%',
+            position: 'absolute', inset: 0, borderRadius: '50%', zIndex: 2,
             background: 'radial-gradient(ellipse at 50% 50%, transparent 40%, rgba(10,6,8,0.55) 75%, rgba(10,6,8,0.88) 100%)',
-            pointerEvents: 'none', zIndex: 2,
+            pointerEvents: 'none',
           }} />
 
           {/* Shimmer */}
           <div style={{
-            position: 'absolute', inset: 0, borderRadius: '50%',
+            position: 'absolute', inset: 0, borderRadius: '50%', zIndex: 3,
             background: 'linear-gradient(135deg, rgba(255,220,180,0.06) 0%, transparent 40%, transparent 60%, rgba(255,200,160,0.04) 100%)',
             animation: 'mirrorShimmer 5s ease-in-out infinite alternate',
-            pointerEvents: 'none', zIndex: 3,
+            pointerEvents: 'none',
           }} />
 
-          {/* Smile prompt */}
+          {/* Smile progress bar */}
           <div style={{
             position: 'absolute', bottom: '10%', left: '50%',
             transform: 'translateX(-50%)', zIndex: 4,
@@ -246,13 +250,10 @@ export default function SmileGate({ visible, onUnlock }: Props) {
             alignItems: 'center', gap: '6px', width: '70%',
           }}>
             <p style={{
-              fontFamily: "'Jost', sans-serif",
-              fontSize: '0.65rem', fontWeight: 200,
-              letterSpacing: '0.3em', textTransform: 'uppercase',
+              fontFamily: "'Jost',sans-serif", fontSize: '0.65rem',
+              fontWeight: 200, letterSpacing: '0.3em', textTransform: 'uppercase',
               color: 'rgba(201,160,128,0.85)', whiteSpace: 'nowrap',
-            }}>
-              {status}
-            </p>
+            }}>{status}</p>
             <div style={{
               width: '100%', height: '3px',
               background: 'rgba(255,255,255,0.08)',
@@ -260,7 +261,7 @@ export default function SmileGate({ visible, onUnlock }: Props) {
             }}>
               <div style={{
                 height: '100%', width: `${progress * 100}%`,
-                background: 'linear-gradient(90deg, #c45b6a, #e89060)',
+                background: 'linear-gradient(90deg,#c45b6a,#e89060)',
                 borderRadius: '4px', transition: 'width 0.12s ease',
                 boxShadow: '0 0 8px rgba(196,91,106,0.7)',
               }} />
@@ -273,10 +274,31 @@ export default function SmileGate({ visible, onUnlock }: Props) {
           <div key={i} style={{
             position: 'absolute', ...pos,
             color: '#c9a080', fontSize: '0.7rem',
-            animation: `sparkleDrift 4s ease-in-out ${(i * 0.5).toFixed(1)}s infinite`,
+            animation: `sparkleDrift 4s ease-in-out ${(i*0.5).toFixed(1)}s infinite`,
           }}>✦</div>
         ))}
       </div>
+
+      {/* Tap to unlock fallback — always shown after 4s */}
+      {tapReady && (
+        <button onClick={onUnlock} style={{
+          padding: '0.85rem 2.8rem',
+          background: 'transparent',
+          border: '1px solid rgba(196,91,106,0.5)',
+          borderRadius: '60px', color: '#f5e6d8',
+          fontFamily: "'Jost',sans-serif",
+          fontSize: '0.8rem', fontWeight: 200,
+          letterSpacing: '0.3em', textTransform: 'uppercase',
+          cursor: 'pointer',
+          animation: 'tapPulse 2s ease-in-out infinite',
+          transition: 'background 0.3s ease',
+        }}
+          onMouseEnter={e => (e.currentTarget.style.background = 'rgba(196,91,106,0.1)')}
+          onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
+        >
+          Tap to Continue →
+        </button>
+      )}
     </div>
   )
 }
